@@ -1,5 +1,8 @@
 name: Daily Fanqie Rank Scraper
 
+permissions:
+  contents: write
+
 on:
   schedule:
     # 每天 UTC 00:00 (北京时间 08:00) 触发

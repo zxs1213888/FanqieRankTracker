@@ -215,17 +215,28 @@ def generate_ai_summaries(categories: list, trends: dict,
         trend_ctx = generate_trend_summary_text(cat_name, trend)
         prompt = build_ai_prompt(cat_name, cat, trend_ctx)
 
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=500,
-                temperature=0.7,
-            )
-            trends[cat_name]["summary"] = response.choices[0].message.content.strip()
-            print(f"  ✅ AI 总结: {cat_name}")
-        except Exception as e:
-            print(f"  ❌ AI 总结失败 {cat_name}: {e}")
+        max_retries = 3
+        success = False
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=500,
+                    temperature=0.7,
+                )
+                trends[cat_name]["summary"] = response.choices[0].message.content.strip()
+                print(f"  ✅ AI 总结: {cat_name}")
+                success = True
+                break
+            except Exception as e:
+                print(f"  ⚠️  AI 总结第{attempt}次失败 {cat_name}: {e}")
+                if attempt < max_retries:
+                    import time
+                    time.sleep(5 * attempt)  # 5s, 10s 递增等待
+
+        if not success:
+            print(f"  ❌ AI 总结最终失败 {cat_name}（已重试{max_retries}次）")
             # 尝试保留旧的 AI 总结
             old = existing_trends.get(cat_name, {}).get("summary", "")
             if old and not is_rule_summary(old):

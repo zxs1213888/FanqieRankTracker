@@ -10,6 +10,7 @@ import re
 import json
 import glob
 import sys
+import argparse
 
 
 def parse_reads(reads_str: str) -> float:
@@ -165,15 +166,27 @@ def build_ai_prompt(cat_name: str, cat: dict, trend_ctx: str) -> str:
 要求：简洁有力，像专业书评人的快评。不要逐本分析，聚焦整体趋势。总字数控制在200字以内。"""
 
 
+def is_rule_summary(summary: str) -> bool:
+    """判断一个总结是否为规则模板生成的（非 AI）。
+    规则摘要特征：短小、分号分隔、以句号结尾、无换行。
+    """
+    if not summary:
+        return True
+    if summary == "首日数据，暂无趋势对比。":
+        return True
+    # 规则摘要一般 < 150 字，用分号分隔，无换行
+    if len(summary) < 150 and "；" in summary and "\n" not in summary:
+        return True
+    return False
+
+
 def generate_ai_summaries(categories: list, trends: dict,
                           api_key: str, base_url: str,
-                          model: str) -> dict:
+                          model: str, force: bool = False,
+                          existing_trends: dict = None) -> dict:
     """通过 OpenAI 兼容 API 为每个分类生成 AI 总结。
 
-    环境变量：
-        API_BASE_URL - API 基础地址（如 https://api.zscc.in/v1）
-        API_KEY      - API 密钥
-        API_MODEL    - 模型名称（如 kimi-k2.5-cc）
+    如果 force=False，会跳过已有 AI 总结的分类（仅补缺）。
     """
     try:
         from openai import OpenAI
@@ -182,11 +195,21 @@ def generate_ai_summaries(categories: list, trends: dict,
         return trends
 
     client = OpenAI(api_key=api_key, base_url=base_url)
+    existing_trends = existing_trends or {}
 
+    skipped = 0
     for cat in categories:
         cat_name = cat["name"]
         if cat_name not in trends:
             continue
+
+        # 检查是否已有 AI 总结（非规则模板）
+        if not force:
+            existing_summary = existing_trends.get(cat_name, {}).get("summary", "")
+            if existing_summary and not is_rule_summary(existing_summary):
+                trends[cat_name]["summary"] = existing_summary
+                skipped += 1
+                continue
 
         trend = trends[cat_name]
         trend_ctx = generate_trend_summary_text(cat_name, trend)
@@ -203,14 +226,28 @@ def generate_ai_summaries(categories: list, trends: dict,
             print(f"  ✅ AI 总结: {cat_name}")
         except Exception as e:
             print(f"  ❌ AI 总结失败 {cat_name}: {e}")
-            trends[cat_name]["summary"] = generate_trend_summary_text(
-                cat_name, trend
-            )
+            # 尝试保留旧的 AI 总结
+            old = existing_trends.get(cat_name, {}).get("summary", "")
+            if old and not is_rule_summary(old):
+                trends[cat_name]["summary"] = old
+                print(f"  ↩️  保留旧 AI 总结: {cat_name}")
+            else:
+                trends[cat_name]["summary"] = generate_trend_summary_text(
+                    cat_name, trend
+                )
+
+    if skipped > 0:
+        print(f"  ⏭️  跳过 {skipped} 个已有 AI 总结的分类")
 
     return trends
 
 
 def main():
+    parser = argparse.ArgumentParser(description="构建 latest_ranks.json")
+    parser.add_argument("--force", action="store_true",
+                        help="强制重新生成所有 AI 总结，忽略已有总结")
+    args = parser.parse_args()
+
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     data_dir = os.path.join(base_dir, "data")
     trends_dir = os.path.join(data_dir, "trends")
@@ -238,6 +275,24 @@ def main():
         prev_data = load_snapshot(prev_path)
         prev_date = prev_data.get("date", "")
         print(f"对比快照: {os.path.basename(prev_path)} ({prev_date})")
+
+    # 加载已有的趋势数据（用于保留已有 AI 总结）
+    existing_trends = {}
+    trend_path = os.path.join(trends_dir, f"{latest_data['date']}.json")
+    if os.path.exists(trend_path) and not args.force:
+        try:
+            with open(trend_path, "r", encoding="utf-8") as f:
+                existing_trend_data = json.load(f)
+                existing_trends = existing_trend_data.get("trends", {})
+            ai_count = sum(1 for t in existing_trends.values()
+                          if not is_rule_summary(t.get("summary", "")))
+            rule_count = len(existing_trends) - ai_count
+            print(f"已有趋势数据: {ai_count} 个 AI 总结, {rule_count} 个待补充")
+        except Exception:
+            pass
+
+    if args.force:
+        print("\n🔄 强制模式：将重新生成所有 AI 总结")
 
     # 对比趋势
     if prev_data:
@@ -270,13 +325,19 @@ def main():
         print(f"  API: {api_base_url}")
         trends = generate_ai_summaries(
             latest_data["categories"], trends,
-            api_key, api_base_url, api_model
+            api_key, api_base_url, api_model,
+            force=args.force,
+            existing_trends=existing_trends
         )
     else:
         missing = [k for k, v in {"API_BASE_URL": api_base_url, "API_KEY": api_key, "API_MODEL": api_model}.items() if not v]
         print(f"\n未配置 AI 服务（缺少: {', '.join(missing)}），使用规则摘要替代。")
         for cat_name, trend in trends.items():
-            if not trend.get("summary"):
+            # 保留已有 AI 总结
+            old = existing_trends.get(cat_name, {}).get("summary", "")
+            if old and not is_rule_summary(old):
+                trend["summary"] = old
+            elif not trend.get("summary"):
                 trend["summary"] = generate_trend_summary_text(cat_name, trend)
 
     # 组装输出
@@ -302,7 +363,6 @@ def main():
     print(f"\n✅ 已生成: {out_path}")
 
     # 写入 trends/YYYY-MM-DD.json
-    trend_path = os.path.join(trends_dir, f"{latest_data['date']}.json")
     trend_output = {
         "date": latest_data["date"],
         "prev_date": prev_date,

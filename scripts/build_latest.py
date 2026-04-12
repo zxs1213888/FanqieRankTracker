@@ -53,6 +53,7 @@ def compare_categories(today_cats: list, prev_cats: list) -> dict:
                 "rank": i + 1,
                 "reads": book.get("reads", "未知"),
                 "title": book.get("title", "未知"),
+                "intro": book.get("intro", "暂无简介"),
             }
         prev_index[cat["name"]] = url_map
 
@@ -97,10 +98,13 @@ def compare_categories(today_cats: list, prev_cats: list) -> dict:
             else:
                 new_books.append(title)
 
-        # 掉出榜单的书
+        # 掉出榜单的书（含简介以便 AI 分析题材）
         for url, info in prev_urls.items():
             if url not in today_urls:
-                dropped_books.append(info["title"])
+                dropped_books.append({
+                    "title": info["title"],
+                    "intro": info.get("intro", "暂无简介")[:100],
+                })
 
         # 排序：涨幅最大的在前
         risers.sort(key=lambda x: int(x["change"].replace("+", "")), reverse=True)
@@ -129,7 +133,12 @@ def generate_trend_summary_text(cat_name: str, trend: dict) -> str:
     if trend["new_count"] > 0:
         parts.append(f"新增{trend['new_count']}本上榜")
     if trend["dropped_count"] > 0:
-        parts.append(f"{trend['dropped_count']}本掉出")
+        dropped_titles = [d["title"] if isinstance(d, dict) else d
+                          for d in trend.get("dropped_books", [])]
+        if dropped_titles:
+            parts.append(f"{trend['dropped_count']}本掉出（{'、'.join('《' + t + '》' for t in dropped_titles)}）")
+        else:
+            parts.append(f"{trend['dropped_count']}本掉出")
     if trend["top_risers"]:
         r = trend["top_risers"][0]
         parts.append(f"《{r['title']}》排名上升{r['change']}位")
@@ -141,8 +150,9 @@ def generate_trend_summary_text(cat_name: str, trend: dict) -> str:
     return "；".join(parts) + "。"
 
 
-def build_ai_prompt(cat_name: str, cat: dict, trend_ctx: str) -> str:
-    """构建 AI 总结的 prompt。"""
+def build_ai_prompt(cat_name: str, cat: dict, trend: dict) -> str:
+    """构建 AI 总结的 prompt（统一模板）。"""
+    # 当前榜单书籍
     intros = []
     for i, book in enumerate(cat.get("books", [])[:20]):
         intros.append(
@@ -152,18 +162,58 @@ def build_ai_prompt(cat_name: str, cat: dict, trend_ctx: str) -> str:
         )
     intros_text = "\n".join(intros)
 
-    return f"""你是一位网文行业分析师。以下是番茄小说「{cat_name}」分类新书榜 Top 20 的书籍信息。
+    # 新上榜书籍
+    new_books = trend.get("new_books", [])
+    new_text = "、".join(f"《{t}》" for t in new_books) if new_books else "无"
 
+    # 掉出榜单书籍（含简介）
+    dropped = trend.get("dropped_books", [])
+    if dropped:
+        dropped_lines = []
+        for d in dropped:
+            if isinstance(d, dict):
+                dropped_lines.append(f"《{d['title']}》（{d.get('intro', '暂无简介')[:50]}）")
+            else:
+                dropped_lines.append(f"《{d}》")
+        dropped_text = "、".join(dropped_lines)
+    else:
+        dropped_text = "无"
+
+    # 排名变动
+    risers = trend.get("top_risers", [])
+    risers_text = "、".join(f"《{r['title']}》{r['change']}" for r in risers) if risers else "无"
+    fallers = trend.get("top_fallers", [])
+    fallers_text = "、".join(f"《{f['title']}》{f['change']}" for f in fallers) if fallers else "无"
+
+    return f"""你是一位网文行业分析师。请根据以下数据，为番茄小说「{cat_name}」分类新书榜生成结构化分析。
+
+## 当前榜单 Top 20
 {intros_text}
 
-榜单动态：{trend_ctx}
+## 榜单变动
+- 新上榜：{new_text}
+- 掉出榜单：{dropped_text}
+- 排名上升：{risers_text}
+- 排名下降：{fallers_text}
 
-请用 2-3 段简短的话总结：
-1. 这个分类当前的热门题材和趋势（哪些元素、设定出现频率高）
-2. 读者偏好风向（甜宠/虐/爽/日常等方向）
-3. 有没有值得关注的差异化新作
+## 输出要求（请严格按以下格式输出，使用 Markdown）
 
-要求：简洁有力，像专业书评人的快评。不要逐本分析，聚焦整体趋势。总字数控制在200字以内。"""
+**🔥 题材趋势**
+用1-2句话总结当前分类的主流题材和高频元素（如穿书/重生/系统/种田等），点明哪些设定扎堆出现。
+
+**📖 读者偏好**
+用1句话概括读者口味方向（甜宠/虐/爽/日常/暗黑等），以及金手指类型偏好。
+
+**🆕 新上榜作品**
+列出新上榜书名，每本用一句话点评其题材亮点或差异化卖点。
+
+**📉 掉出榜单**
+列出掉出书名及其题材方向，简要分析可能掉出的原因（如题材饱和、同质化等）。
+
+**💡 值得关注**
+挑1-2本有差异化潜力的作品，说明理由。
+
+要求：每个板块2-3句话，总字数250字以内。语言简洁专业，像行业快报。"""
 
 
 def is_rule_summary(summary: str) -> bool:
@@ -212,8 +262,7 @@ def generate_ai_summaries(categories: list, trends: dict,
                 continue
 
         trend = trends[cat_name]
-        trend_ctx = generate_trend_summary_text(cat_name, trend)
-        prompt = build_ai_prompt(cat_name, cat, trend_ctx)
+        prompt = build_ai_prompt(cat_name, cat, trend)
 
         max_retries = 3
         success = False
